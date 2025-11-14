@@ -1,0 +1,240 @@
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except:
+    pass
+
+class TrainAudioSpectrogramDataset(Dataset):
+    def __init__(self, root_dir, categories, max_frames=512, sample_rate=22050):
+        self.root_dir = root_dir
+        self.categories = categories
+        self.max_frames = max_frames
+        self.sample_rate = sample_rate
+        self.file_list = []
+        self.class_to_idx = {cat: i for i, cat in enumerate(categories)}
+
+        for cat_name in self.categories:
+            cat_dir = os.path.join(root_dir, cat_name)
+            if not os.path.exists(cat_dir):
+                continue
+            files_in_cat = [os.path.join(cat_dir, f) for f in os.listdir(cat_dir) if f.endswith(".wav")]
+            label_idx = self.class_to_idx[cat_name]
+            self.file_list.extend([(file_path, label_idx) for file_path in files_in_cat])
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        path, label = self.file_list[idx]
+        wav, sr = torchaudio.load(path)
+        if wav.size(0) > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+
+        mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sr, n_fft=1024, hop_length=256, n_mels=128
+        )(wav)
+        log_spec = torch.log1p(mel_spec)
+
+        _, _, n_frames = log_spec.shape
+        if n_frames < self.max_frames:
+            log_spec = F.pad(log_spec, (0, self.max_frames - n_frames))
+        else:
+            log_spec = log_spec[:, :, :self.max_frames]
+
+        label_vec = F.one_hot(torch.tensor(label), num_classes=len(self.categories)).float()
+        return log_spec, label_vec
+
+class CGAN_Generator(nn.Module):
+    def __init__(self, latent_dim, num_categories, spec_shape=(128, 512)):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_categories = num_categories
+        self.spec_shape = spec_shape
+
+        self.fc = nn.Linear(latent_dim + num_categories, 256 * 8 * 32)
+        self.unflatten_shape = (256, 8, 32)
+
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
+            nn.ReLU()
+        )
+
+    def forward(self, z, y):
+        h = torch.cat([z, y], dim=1)
+        h = self.fc(h)
+        h = h.view(-1, *self.unflatten_shape)
+        return self.net(h)
+
+class CGAN_Discriminator(nn.Module):
+    def __init__(self, num_categories, spec_shape=(128, 512)):
+        super().__init__()
+        self.num_categories = num_categories
+        self.spec_shape = spec_shape
+        H, W = spec_shape
+
+        self.label_embedding = nn.Linear(num_categories, H * W)
+
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 1, kernel_size=(8, 32), stride=1, padding=0)
+        )
+
+    def forward(self, spec, y):
+        label_map = self.label_embedding(y).view(-1, 1, *self.spec_shape)
+        h = torch.cat([spec, label_map], dim=1)
+        logit = self.net(h)
+        return logit.view(-1, 1)
+
+def generate_audio_gan(generator, category_idx, num_samples, device, sample_rate=22050):
+    generator.eval()
+    y = F.one_hot(torch.tensor([category_idx] * num_samples), 
+                  num_classes=generator.num_categories).float().to(device)
+    z = torch.randn(num_samples, generator.latent_dim, device=device)
+
+    with torch.no_grad():
+        log_spec_gen = generator(z, y)
+
+    spec_gen = torch.expm1(log_spec_gen).squeeze(1)
+    spec_gen = torch.clamp(spec_gen, min=0, max=100) + 1e-6
+
+    inverse_mel = torchaudio.transforms.InverseMelScale(
+        n_stft=513, n_mels=128, sample_rate=sample_rate
+    ).to(device)
+    linear_spec = inverse_mel(spec_gen)
+
+    griffin = torchaudio.transforms.GriffinLim(
+        n_fft=1024, hop_length=256, win_length=1024, n_iter=64
+    ).to(device)
+    waveform = griffin(linear_spec)
+    
+    waveform = waveform / (torch.max(torch.abs(waveform)) + 1e-8) * 0.9
+    return waveform.cpu()
+
+def train_gan(generator, discriminator, dataloader, device, categories, 
+              epochs, lr, latent_dim, save_interval=10):
+    
+    os.makedirs("gan_audio", exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
+    
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+    criterion = nn.BCEWithLogitsLoss()
+
+    for epoch in range(1, epochs + 1):
+        generator.train()
+        discriminator.train()
+        
+        loop = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
+        
+        for real_specs, labels in loop:
+            real_specs, labels = real_specs.to(device), labels.to(device)
+            batch_size = real_specs.size(0)
+
+            real_labels = torch.ones(batch_size, 1, device=device)
+            fake_labels = torch.zeros(batch_size, 1, device=device)
+
+            # Train Discriminator
+            optimizer_D.zero_grad()
+            real_output = discriminator(real_specs, labels)
+            loss_D_real = criterion(real_output, real_labels)
+            
+            z = torch.randn(batch_size, latent_dim, device=device)
+            fake_specs = generator(z, labels)
+            fake_output = discriminator(fake_specs.detach(), labels)
+            loss_D_fake = criterion(fake_output, fake_labels)
+            
+            loss_D = (loss_D_real + loss_D_fake) / 2
+            loss_D.backward()
+            optimizer_D.step()
+
+            # Train Generator
+            optimizer_G.zero_grad()
+            output = discriminator(fake_specs, labels)
+            loss_G = criterion(output, real_labels)
+            loss_G.backward()
+            optimizer_G.step()
+
+            loop.set_postfix(D_loss=f'{loss_D.item():.4f}', G_loss=f'{loss_G.item():.4f}')
+        print(f"\nEpoch {epoch} - Generating samples...")
+        for cat_idx, cat_name in enumerate(categories):
+            wav = generate_audio_gan(generator, cat_idx, 1, device)
+            fname = f"gan_audio/{cat_name}_ep{epoch:03d}.wav"
+            
+            # Ensure proper shape (channels, samples)
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+            elif wav.dim() == 3:
+                wav = wav.squeeze(0)
+            
+            torchaudio.save(fname, wav, sample_rate=22050)
+            print(f"  Saved: {fname}")
+        if epoch % save_interval == 0:
+            torch.save({
+                'epoch': epoch,
+                'generator_state_dict': generator.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
+            }, f'checkpoints/checkpoint_epoch_{epoch:03d}.pt')
+            print(f"Checkpoint saved: epoch {epoch}")
+
+
+def main():
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    LATENT_DIM = 100
+    EPOCHS = 200
+    BATCH_SIZE = 32
+    LEARNING_RATE = 2e-4
+    
+    print(f"Device: {DEVICE}")
+    
+    TRAIN_PATH = '/content/drive/MyDrive/train/train'
+    train_categories = sorted([d for d in os.listdir(TRAIN_PATH) 
+                              if os.path.isdir(os.path.join(TRAIN_PATH, d))])
+    
+    print(f"Categories: {train_categories}\n")
+
+    train_dataset = TrainAudioSpectrogramDataset(TRAIN_PATH, train_categories)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+
+    generator = CGAN_Generator(LATENT_DIM, len(train_categories)).to(DEVICE)
+    discriminator = CGAN_Discriminator(len(train_categories)).to(DEVICE)
+
+    train_gan(generator, discriminator, train_loader, DEVICE, train_categories, 
+              EPOCHS, LEARNING_RATE, LATENT_DIM)
+    
+    torch.save(generator.state_dict(), 'final_generator.pt')
+    print("Training complete!")
+
+if __name__ == '__main__':
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
+    main()
