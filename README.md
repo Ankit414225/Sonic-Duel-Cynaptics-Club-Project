@@ -64,11 +64,51 @@ duration = 2.5 seconds
 
 n_mels = 128
 
-____________________________________________________________________________________________________________________________________________________________________Model is trained using:
-
+Model is trained using:
 Adam optimizer
 
 CrossEntropy loss
 
 Early stopping with patience
+__________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________
+Conditional Audio Generation
 
+The generator receives two inputs:
+
+Random noise vector (latent space)
+
+One-hot encoded label (category)
+
+This allows you to generate audio for specific sound categories (e.g., dog bark, drill, siren).
+_____________________________________________________________________________________________________________________________________________________________________________________________________________________
+Spectrogram-Based Workflow
+
+The model:
+
+Converts audio - log-mel spectrograms
+
+Trains a CGAN on these spectrograms
+
+Converts synthesized mel spectrograms - waveform using:
+
+InverseMelScale
+
+GriffinLim phase reconstruction
+_____________________________________________________________________________________________________________________________________________________________________________________________________________________Model Architecture Overview
+1. Generator
+
+Input: (noise vector z + label vector y)
+
+Fully connected layer → reshape
+
+4-layer ConvTranspose2d upsampling
+
+Output: (1 × 128 × 512) log-mel spectrogram
+
+2. Discriminator
+
+Input: (spectrogram + embedded label map)
+
+4 Conv2d downsampling blocks
+
+Output: real/fake probability
