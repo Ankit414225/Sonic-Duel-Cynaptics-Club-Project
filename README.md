@@ -96,7 +96,8 @@ Converts synthesized mel spectrograms - waveform using:
 InverseMelScale
 
 GriffinLim phase reconstruction
-____________________________________________________________________________________________________________________________________________________________________________________________________________________Model Architecture Overview
+____________________________________________________________________________________________________________________________________________________________________________________________
+Model Architecture Overview
 1. Generator
 
 Input: (noise vector z + label vector y)
@@ -111,6 +112,3 @@ Output: (1 × 128 × 512) log-mel spectrogram
 
 Input: (spectrogram + embedded label map)
 
-4 Conv2d downsampling blocks
-
-Output: real/fake probability
